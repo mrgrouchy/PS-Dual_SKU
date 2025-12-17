@@ -1,5 +1,5 @@
 # PowerShell script to compare users in ENTERPRISEPREMIUM and SPE_E5 license SKUs using Microsoft Graph
-# Enhanced with progress bars and visual reporting
+# Enhanced with progress bars, visual reporting, and divide-by-zero protection
 # Requires Microsoft.Graph PowerShell module and User.Read.All, Organization.Read.All permissions
 
 # Install and import required module if not present
@@ -11,13 +11,24 @@ Import-Module Microsoft.Graph.Users, Microsoft.Graph.Identity.DirectoryManagemen
 
 # Connect to Microsoft Graph
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
-Connect-MgGraph -Scopes "User.Read.All", "Organization.Read.All"
-Write-Host "Connected successfully!" -ForegroundColor Green
+try {
+    Connect-MgGraph -Scopes "User.Read.All", "Organization.Read.All"
+    Write-Host "Connected successfully!" -ForegroundColor Green
+} catch {
+    Write-Error "Failed to connect to Microsoft Graph: $_"
+    return
+}
 
-# Get total user count for progress tracking
+# Get total user count for progress tracking (with fallback)
 Write-Host "Getting total user count..." -ForegroundColor Cyan
-$totalUsers = (Get-MgUser -All -CountVariable userCount -ConsistencyLevel eventual).Count
-Write-Host "Found $totalUsers total users in tenant." -ForegroundColor Green
+try {
+    $totalUsers = (Get-MgUser -All -CountVariable userCount -ConsistencyLevel eventual).Count
+    if ($totalUsers -eq 0) { $totalUsers = 1 }  # Prevent divide by zero
+} catch {
+    Write-Warning "Could not get total user count, using fallback method..."
+    $totalUsers = 1  # Minimum value to prevent divide by zero
+}
+Write-Host "Using total users: $totalUsers for progress tracking." -ForegroundColor Green
 
 # Get SKU details for both licenses
 Write-Progress -Activity "Analyzing Licenses" -Status "Getting SKU details" -PercentComplete 5
@@ -34,28 +45,47 @@ if (-not $enterprisePremiumSku -or -not $speE5Sku) {
 Write-Host "`nENTERPRISEPREMIUM SKU ID: $($enterprisePremiumSku.SkuId)" -ForegroundColor Green
 Write-Host "SPE_E5 SKU ID: $($speE5Sku.SkuId)" -ForegroundColor Green
 
-# Get all users with their licenses (with progress bar)
+# Get all users with their licenses (with robust progress and error handling)
 Write-Progress -Activity "Analyzing User Licenses" -Status "Processing users" -PercentComplete 10
 $allUsers = @()
 $userCounter = 0
+$processedUsers = 0
 
-Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, AssignedLicenses, LicenseDetails | 
-ForEach-Object { 
-    $userCounter++
-    $percentComplete = [math]::Min(90, ($userCounter / $totalUsers) * 100)
-    Write-Progress -Activity "Analyzing User Licenses ($userCounter/$totalUsers)" -Status "Processing $($_.DisplayName)" -PercentComplete $percentComplete
-    
-    $userLicenses = Get-MgUserLicenseDetail -UserId $_.Id
-    [PSCustomObject]@{
-        Id = $_.Id
-        DisplayName = $_.DisplayName
-        UserPrincipalName = $_.UserPrincipalName
-        EnterprisePremium = ($userLicenses.SkuId -contains $enterprisePremiumSku.SkuId)
-        SPE_E5 = ($userLicenses.SkuId -contains $speE5Sku.SkuId)
+try {
+    Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, AssignedLicenses, LicenseDetails -ErrorAction Stop | 
+    ForEach-Object { 
+        $userCounter++
+        try {
+            $percentComplete = if ($totalUsers -gt 0) { [math]::Min(90, ($userCounter / $totalUsers) * 100) } else { 50 }
+            Write-Progress -Activity "Analyzing User Licenses ($userCounter)" -Status "Processing $($_.DisplayName ?? 'User')" -PercentComplete $percentComplete -Id 1
+            
+            $userLicenses = Get-MgUserLicenseDetail -UserId $_.Id -ErrorAction SilentlyContinue
+            $allUsers += [PSCustomObject]@{
+                Id = $_.Id
+                DisplayName = $_.DisplayName ?? 'N/A'
+                UserPrincipalName = $_.UserPrincipalName ?? 'N/A'
+                EnterprisePremium = ($userLicenses.SkuId -contains $enterprisePremiumSku.SkuId)
+                SPE_E5 = ($userLicenses.SkuId -contains $speE5Sku.SkuId)
+            }
+            $processedUsers++
+        } catch {
+            Write-Warning "Skipped user $($_.Id): $_"
+            $userCounter--  # Don't count failed users in progress
+        }
     }
-} | ForEach-Object { $allUsers += $_ }
+} catch {
+    Write-Error "Failed to process users: $_"
+    $allUsers = @()
+}
 
-Write-Progress -Activity "Analyzing User Licenses" -Completed
+Write-Progress -Activity "Analyzing User Licenses" -Id 1 -Completed
+Write-Host "Successfully processed $processedUsers users." -ForegroundColor Green
+
+if ($allUsers.Count -eq 0) {
+    Write-Error "No users could be processed. Exiting."
+    Disconnect-MgGraph
+    return
+}
 
 # Categorize users with progress visualization
 Write-Progress -Activity "Categorizing Users" -Status "Analyzing license combinations" -PercentComplete 95
@@ -67,12 +97,20 @@ $neither = $allUsers | Where-Object { -not $_.EnterprisePremium -and -not $_.SPE
 
 Write-Progress -Activity "Categorizing Users" -Completed
 
-# Visual progress summary
+# Safe percentage calculation function
+function Get-SafePercent {
+    param($Count, $Total)
+    if ($Total -le 0) { return 0 }
+    return [math]::Round(($Count / $Total) * 100, 1)
+}
+
+# Visual progress summary (divide-by-zero safe)
 Clear-Host
+$totalAnalyzed = $allUsers.Count
 Write-Host "╔══════════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
 Write-Host "║                       LICENSE ANALYSIS COMPLETE                      ║" -ForegroundColor Cyan
 Write-Host "╠══════════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
-Write-Host "║  Total Users Analyzed: $totalUsers                                   ║" -ForegroundColor White
+Write-Host "║  Total Users Analyzed: $totalAnalyzed                                ║" -ForegroundColor White
 Write-Host "╠══════════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
 Write-Host "║  📊 ENTERPRISEPREMIUM only: $($onlyEnterprisePremium.Count)        ║" -ForegroundColor Yellow
 Write-Host "║  🔵 SPE_E5 only: $($onlySPE_E5.Count)                              ║" -ForegroundColor Blue
@@ -80,13 +118,13 @@ Write-Host "║  🟣 BOTH licenses: $($bothLicenses.Count)                     
 Write-Host "║  ⚪ NEITHER license: $($neither.Count)                              ║" -ForegroundColor Gray
 Write-Host "╚══════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
-# Progress bar visualization for each category
+# Progress bar visualization for each category (divide-by-zero safe)
 $barWidth = 50
 Write-Host "`n📈 License Distribution Chart:" -ForegroundColor Cyan
 
 # EnterprisePremium only bar
-$epPercent = [math]::Round(($onlyEnterprisePremium.Count / $totalUsers) * 100, 1)
-$epBarLength = [math]::Round(($onlyEnterprisePremium.Count / $totalUsers) * $barWidth)
+$epPercent = Get-SafePercent $onlyEnterprisePremium.Count $totalAnalyzed
+$epBarLength = [math]::Round(($onlyEnterprisePremium.Count / [math]::Max(1, $totalAnalyzed)) * $barWidth)
 Write-Host ("ENTERPRISEPREMIUM only [{0}{1}] {2,5:F1}% ({3})" -f 
     ('█' * $epBarLength), 
     ('░' * ($barWidth - $epBarLength)), 
@@ -94,8 +132,8 @@ Write-Host ("ENTERPRISEPREMIUM only [{0}{1}] {2,5:F1}% ({3})" -f
     $onlyEnterprisePremium.Count) -ForegroundColor Yellow
 
 # SPE_E5 only bar
-$spePercent = [math]::Round(($onlySPE_E5.Count / $totalUsers) * 100, 1)
-$speBarLength = [math]::Round(($onlySPE_E5.Count / $totalUsers) * $barWidth)
+$spePercent = Get-SafePercent $onlySPE_E5.Count $totalAnalyzed
+$speBarLength = [math]::Round(($onlySPE_E5.Count / [math]::Max(1, $totalAnalyzed)) * $barWidth)
 Write-Host ("SPE_E5 only         [{0}{1}] {2,5:F1}% ({3})" -f 
     ('█' * $speBarLength), 
     ('░' * ($barWidth - $speBarLength)), 
@@ -103,8 +141,8 @@ Write-Host ("SPE_E5 only         [{0}{1}] {2,5:F1}% ({3})" -f
     $onlySPE_E5.Count) -ForegroundColor Blue
 
 # Both licenses bar
-$bothPercent = [math]::Round(($bothLicenses.Count / $totalUsers) * 100, 1)
-$bothBarLength = [math]::Round(($bothLicenses.Count / $totalUsers) * $barWidth)
+$bothPercent = Get-SafePercent $bothLicenses.Count $totalAnalyzed
+$bothBarLength = [math]::Round(($bothLicenses.Count / [math]::Max(1, $totalAnalyzed)) * $barWidth)
 Write-Host ("BOTH licenses       [{0}{1}] {2,5:F1}% ({3})" -f 
     ('█' * $bothBarLength), 
     ('░' * ($barWidth - $bothBarLength)), 
@@ -112,8 +150,8 @@ Write-Host ("BOTH licenses       [{0}{1}] {2,5:F1}% ({3})" -f
     $bothLicenses.Count) -ForegroundColor Magenta
 
 # Neither bar
-$neitherPercent = [math]::Round(($neither.Count / $totalUsers) * 100, 1)
-$neitherBarLength = [math]::Round(($neither.Count / $totalUsers) * $barWidth)
+$neitherPercent = Get-SafePercent $neither.Count $totalAnalyzed
+$neitherBarLength = [math]::Round(($neither.Count / [math]::Max(1, $totalAnalyzed)) * $barWidth)
 Write-Host ("NEITHER license     [{0}{1}] {2,5:F1}% ({3})" -f 
     ('█' * $neitherBarLength), 
     ('░' * ($barWidth - $neitherBarLength)), 
@@ -138,11 +176,11 @@ if ($bothLicenses.Count -gt 0) {
     $bothLicenses | Select-Object DisplayName, UserPrincipalName | Format-Table -AutoSize
 }
 
-# Export summary with progress
+# Export summary with progress (divide-by-zero safe)
 Write-Progress -Activity "Exporting Reports" -Status "Creating CSV files" -PercentComplete 98
 $resultSummary = [PSCustomObject]@{
     'Timestamp' = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    'Total Users Analyzed' = $totalUsers
+    'Total Users Analyzed' = $totalAnalyzed
     'Only ENTERPRISEPREMIUM Count' = $onlyEnterprisePremium.Count
     'Only SPE_E5 Count' = $onlySPE_E5.Count
     'Both Licenses Count' = $bothLicenses.Count
@@ -163,4 +201,8 @@ Write-Progress -Activity "Exporting Reports" -Completed
 Write-Host "`n✅ ANALYSIS COMPLETE!" -ForegroundColor Green
 Write-Host "📁 Summary report: $summaryFile" -ForegroundColor Green
 Write-Host "📁 Detailed users: AllUsersLicenseDetails_*.csv" -ForegroundColor Green
+Write-Host "📊 Processed: $processedUsers / $totalAnalyzed users" -ForegroundColor Green
 Write-Host "`n💡 To disconnect: Disconnect-MgGraph" -ForegroundColor Cyan
+
+# Cleanup
+try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
