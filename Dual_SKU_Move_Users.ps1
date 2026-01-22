@@ -4,9 +4,9 @@ param(
 
 # --- HARDCODE YOUR GROUP IDs HERE ---
 $GroupIds = @(
-    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",  # Group 1 ID
-    "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"  # Group 2 ID
-)  # Edit these Object IDs [web:55]
+    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",  # Group 1 ID - EDIT THESE
+    "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"  # Group 2 ID - EDIT THESE
+)  # [web:55]
 
 # --- Modules ---
 Import-Module PSSQLite
@@ -38,9 +38,10 @@ VALUES (@UPN, @EA1, @DateAdded);
 
 # Process groups
 foreach ($groupId in $GroupIds) {
-    Write-Host "Processing group: $groupId"
+    Write-Host "Processing group: $groupId" -ForegroundColor Yellow
 
-    $members = Get-MgGroupMember -GroupId $groupId  # [web:55]
+    $members = Get-MgGroupMember -GroupId $groupId -All  # Full pagination [web:78]
+    Write-Host "  Found $($members.Count) members"
 
     foreach ($m in $members) {
         if ($m.AdditionalProperties['@odata.type'] -ne '#microsoft.graph.user') { continue }
@@ -49,12 +50,21 @@ foreach ($groupId in $GroupIds) {
         $upn = $user.UserPrincipalName
         $ea1Value = $user.OnPremisesExtensionAttributes.extensionAttribute1
 
-        $params = @{
-            UPN       = $upn
-            EA1       = $ea1Value
-            DateAdded = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        }
+        # Dedupe: skip if UPN already exists
+        $exists = Invoke-SqliteQuery -DataSource $DatabasePath -Query "SELECT COUNT(*) as cnt FROM GroupMembers WHERE UPN = @UPN;" -SqlParameters @{UPN = $upn} | Select-Object -ExpandProperty cnt  # [web:16][web:71]
 
-        Invoke-SqliteQuery -DataSource $DatabasePath -Query $insertSql -SqlParameters $params  # [web:16]
+        if ($exists -eq 0) {
+            $params = @{
+                UPN       = $upn
+                EA1       = $ea1Value
+                DateAdded = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }
+            Invoke-SqliteQuery -DataSource $DatabasePath -Query $insertSql -SqlParameters $params  # [web:16]
+            Write-Host "  Added: $upn" -ForegroundColor Green
+        } else {
+            Write-Host "  Skip duplicate: $upn" -ForegroundColor Gray
+        }
     }
 }
+
+Write-Host "`nDone. Check with view.ps1" -ForegroundColor Cyan
