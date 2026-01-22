@@ -1,17 +1,19 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$GroupId,  # Entra group ID (Object ID)
-
-    [Parameter(Mandatory = $true)]
-    [string]$DatabasePath = "C:\Temp\GroupMembers.sqlite"
+    [string]$DatabasePath = ".\GroupMembers.sqlite"
 )
 
-# --- Modules (install once: Install-Module Microsoft.Graph -Scope CurrentUser) ---
+# --- HARDCODE YOUR GROUP IDs HERE ---
+$GroupIds = @(
+    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",  # Group 1 ID
+    "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"  # Group 2 ID
+)  # Edit these Object IDs [web:55]
+
+# --- Modules ---
 Import-Module PSSQLite
 Import-Module Microsoft.Graph.Groups
 Import-Module Microsoft.Graph.Users
 
-Connect-MgGraph -Scopes "Group.Read.All", "User.Read.All"  # Graph permissions [web:55]
+Connect-MgGraph -Scopes "Group.Read.All", "User.Read.All"  # [web:55]
 
 # Ensure DB
 if (-not (Test-Path $DatabasePath)) {
@@ -34,23 +36,25 @@ INSERT INTO GroupMembers (UPN, EA1, DateAdded)
 VALUES (@UPN, @EA1, @DateAdded);
 "@
 
-# Get cloud group members
-$members = Get-MgGroupMember -GroupId $GroupId  # [web:55]
+# Process groups
+foreach ($groupId in $GroupIds) {
+    Write-Host "Processing group: $groupId"
 
-foreach ($m in $members) {
-    if ($m.AdditionalProperties['@odata.type'] -ne '#microsoft.graph.user') { continue }
+    $members = Get-MgGroupMember -GroupId $groupId  # [web:55]
 
-    # Get user with EA1 (synced on-prem value)
-    $user = Get-MgUser -UserId $m.Id -Property "userPrincipalName,onPremisesExtensionAttributes"  # [web:55][web:58][web:59]
+    foreach ($m in $members) {
+        if ($m.AdditionalProperties['@odata.type'] -ne '#microsoft.graph.user') { continue }
 
-    $upn = $user.UserPrincipalName
-    $ea1Value = $user.OnPremisesExtensionAttributes.extensionAttribute1  # Direct path [web:55][web:59]
+        $user = Get-MgUser -UserId $m.Id -Property "userPrincipalName,onPremisesExtensionAttributes"  # [web:55][web:59]
+        $upn = $user.UserPrincipalName
+        $ea1Value = $user.OnPremisesExtensionAttributes.extensionAttribute1
 
-    $params = @{
-        UPN       = $upn
-        EA1       = $ea1Value
-        DateAdded = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        $params = @{
+            UPN       = $upn
+            EA1       = $ea1Value
+            DateAdded = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        }
+
+        Invoke-SqliteQuery -DataSource $DatabasePath -Query $insertSql -SqlParameters $params  # [web:16]
     }
-
-    Invoke-SqliteQuery -DataSource $DatabasePath -Query $insertSql -SqlParameters $params  # [web:16]
 }
